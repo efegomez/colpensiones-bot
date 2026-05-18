@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: colpensiones-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium && python -m playwright install-deps chromium
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 60 --workers 1
+    envVars:
+      - key: CEDULA
+        sync: false
+      - key: PHONE_NUMBER
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
