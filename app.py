@@ -11,7 +11,6 @@ from datetime import datetime
 from threading import Thread
 
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
@@ -70,52 +69,9 @@ def consultar_estado() -> dict:
         r_get = session.get(url, timeout=15)
         log.info(f"GET {url} → {r_get.status_code}")
 
-        soup = BeautifulSoup(r_get.text, "html.parser")
-
-        # Extraer campos del formulario (token CSRF si existe)
-        form = soup.find("form")
-        post_data = {}
-        if form:
-            for inp in form.find_all("input", {"type": ["hidden", "text", "number"]}):
-                name = inp.get("name", "")
-                value = inp.get("value", "")
-                if name:
-                    post_data[name] = value
-
-        # Rellenar con nuestros datos
-        # Nombres típicos del portal Nexura de Colpensiones
-        for key in list(post_data.keys()):
-            kl = key.lower()
-            if "tipo" in kl or "document" in kl or "tdoc" in kl:
-                post_data[key] = "CC"
-            elif "numero" in kl or "ndoc" in kl or "cedula" in kl:
-                post_data[key] = CEDULA
-            elif "anio" in kl or "año" in kl or "primero" in kl or "rad1" in kl:
-                post_data[key] = RADICADO_ANIO
-            elif "comp" in kl or "rad2" in kl or "segundo" in kl:
-                post_data[key] = RADICADO_COMP
-
-        # También intentar con nombres directos si el form está vacío
-        if not post_data or len(post_data) < 3:
-            post_data = {
-                "tipoDoc": "CC",
-                "numDoc": CEDULA,
-                "anioRad": RADICADO_ANIO,
-                "compRad": RADICADO_COMP,
-            }
-
-        # POST al formulario
-        action = form.get("action", url) if form else url
-        if action.startswith("/"):
-            action = "https://sede.colpensiones.gov.co" + action
-
-        log.info(f"POST {action} con datos: {list(post_data.keys())}")
-        r_post = session.post(action, data=post_data, timeout=20)
-        log.info(f"POST → {r_post.status_code}")
-
-        # Parsear respuesta
-        soup2 = BeautifulSoup(r_post.text, "html.parser")
-        texto = soup2.get_text(" ", strip=True)
+        # Buscar en el HTML directamente con regex
+        html = r_get.text
+        texto = re.sub(r'<[^>]+>', ' ', html)  # quitar tags HTML
 
         # Buscar etapa y estado en el texto de respuesta
         etapas = [
