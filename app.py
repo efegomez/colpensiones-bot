@@ -1,191 +1,228 @@
 """
 app.py — Bot de WhatsApp para consulta de Colpensiones
 =======================================================
-Servidor Flask que actúa como webhook de Twilio.
-
-Flujo:
-  1. Usuario escribe cualquier mensaje al número de Twilio en WhatsApp
-  2. Twilio envía el mensaje a este servidor via POST /webhook
-  3. El servidor consulta el estado del trámite en Colpensiones
-  4. Responde automáticamente al usuario por WhatsApp
-
-Comandos reconocidos:
-  - "consultar", "estado", "info", "hola", o cualquier mensaje
-    → responde con el estado actual del trámite
-
-Despliegue: Render.com (gratuito)
+Servidor Flask + webhook Twilio. Sin Playwright — usa requests.
 """
 
 import os
-import json
+import re
 import logging
 from datetime import datetime
-from pathlib import Path
+from threading import Thread
 
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 load_dotenv()
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  [%(levelname)s]  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("colpensiones_webhook")
+log = logging.getLogger("colpensiones_bot")
 
 app = Flask(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-CEDULA          = os.environ.get("CEDULA", "")
-RADICADO_ANIO   = "2026"
-RADICADO_COMP   = "7487180"
-CONSULTA_URL    = "https://sede.colpensiones.gov.co/tramite/updInfo/39/"
+CEDULA              = os.environ.get("CEDULA", "")
+TWILIO_ACCOUNT_SID  = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM         = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+RADICADO_ANIO       = "2026"
+RADICADO_COMP       = "7487180"
 
-# ─── Consulta Colpensiones ────────────────────────────────────────────────────
+# Estado más reciente conocido (respaldo si el portal no responde)
+ULTIMO_ESTADO  = {
+    "etapa": "ANÁLISIS",
+    "estado": "Solicitud en análisis",
+    "fecha": "12/05/2026",
+    "radicado": f"{RADICADO_ANIO}_{RADICADO_COMP}",
+    "fuente": "último registro conocido",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-CO,es;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+# ─── Consulta por requests ────────────────────────────────────────────────────
 def consultar_estado() -> dict:
-    resultado = {
-        "etapa": "ANÁLISIS",
-        "estado": "Solicitud en análisis",
-        "fecha_actualizacion": "12/05/2026",
-        "numero_radicado": f"{RADICADO_ANIO}_{RADICADO_COMP}",
-        "error": None,
-    }
+    resultado = ULTIMO_ESTADO.copy()
+    resultado["timestamp"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-            )
-            page = context.new_page()
-            page.goto(CONSULTA_URL, wait_until="networkidle", timeout=30_000)
+        session = requests.Session()
+        session.headers.update(HEADERS)
 
-            # Rellenar formulario
-            page.wait_for_selector("select", timeout=15_000)
-            page.locator("select").first.select_option(label="CC - Cédula de ciudadanía")
-            campos = page.locator("input[type='text'], input[type='number'], input:not([type])")
-            campos.nth(0).fill(CEDULA)
-            campos.nth(1).fill(RADICADO_ANIO)
-            campos.nth(2).fill(RADICADO_COMP)
+        # GET para obtener la página y cookies/tokens
+        url = "https://sede.colpensiones.gov.co/tramite/updInfo/39/"
+        r_get = session.get(url, timeout=15)
+        log.info(f"GET {url} → {r_get.status_code}")
 
-            # Enviar
-            page.locator(
-                "button[type='submit'], input[type='submit'], "
-                "button:has-text('Consultar'), button:has-text('Buscar')"
-            ).first.click()
-            page.wait_for_load_state("networkidle", timeout=20_000)
+        soup = BeautifulSoup(r_get.text, "html.parser")
 
-            # Extraer etapa activa
-            contenido = page.content()
-            estados_conocidos = [
-                "Solicitud en análisis", "Análisis", "Radicado",
-                "Verificación", "Envío Análisis", "Atendida",
-                "Resuelta", "Negada", "Aprobada",
-            ]
-            for estado in estados_conocidos:
-                if estado.lower() in contenido.lower():
-                    resultado["estado"] = estado
-                    break
+        # Extraer campos del formulario (token CSRF si existe)
+        form = soup.find("form")
+        post_data = {}
+        if form:
+            for inp in form.find_all("input", {"type": ["hidden", "text", "number"]}):
+                name = inp.get("name", "")
+                value = inp.get("value", "")
+                if name:
+                    post_data[name] = value
 
-            # Buscar fecha
-            import re
-            fechas = re.findall(r'\d{2}/\d{2}/\d{4}', contenido)
-            if fechas:
-                resultado["fecha_actualizacion"] = fechas[0]
+        # Rellenar con nuestros datos
+        # Nombres típicos del portal Nexura de Colpensiones
+        for key in list(post_data.keys()):
+            kl = key.lower()
+            if "tipo" in kl or "document" in kl or "tdoc" in kl:
+                post_data[key] = "CC"
+            elif "numero" in kl or "ndoc" in kl or "cedula" in kl:
+                post_data[key] = CEDULA
+            elif "anio" in kl or "año" in kl or "primero" in kl or "rad1" in kl:
+                post_data[key] = RADICADO_ANIO
+            elif "comp" in kl or "rad2" in kl or "segundo" in kl:
+                post_data[key] = RADICADO_COMP
 
-            browser.close()
-            log.info(f"✅ Consulta OK: {resultado['estado']}")
+        # También intentar con nombres directos si el form está vacío
+        if not post_data or len(post_data) < 3:
+            post_data = {
+                "tipoDoc": "CC",
+                "numDoc": CEDULA,
+                "anioRad": RADICADO_ANIO,
+                "compRad": RADICADO_COMP,
+            }
+
+        # POST al formulario
+        action = form.get("action", url) if form else url
+        if action.startswith("/"):
+            action = "https://sede.colpensiones.gov.co" + action
+
+        log.info(f"POST {action} con datos: {list(post_data.keys())}")
+        r_post = session.post(action, data=post_data, timeout=20)
+        log.info(f"POST → {r_post.status_code}")
+
+        # Parsear respuesta
+        soup2 = BeautifulSoup(r_post.text, "html.parser")
+        texto = soup2.get_text(" ", strip=True)
+
+        # Buscar etapa y estado en el texto de respuesta
+        etapas = [
+            "ATENDIDA", "Atendida", "ANÁLISIS", "Análisis",
+            "ENVÍO ANÁLISIS", "Envío Análisis", "VERIFICACIÓN",
+            "Verificación", "RADICADO", "Radicado",
+        ]
+        for etapa in etapas:
+            if etapa.lower() in texto.lower():
+                resultado["etapa"] = etapa.upper()
+                resultado["fuente"] = "portal en vivo"
+                log.info(f"✅ Etapa encontrada: {etapa}")
+                break
+
+        estados = [
+            "Solicitud en análisis", "Solicitud atendida",
+            "En análisis", "Aprobada", "Negada", "Resuelta",
+        ]
+        for estado in estados:
+            if estado.lower() in texto.lower():
+                resultado["estado"] = estado
+                resultado["fuente"] = "portal en vivo"
+                log.info(f"✅ Estado encontrado: {estado}")
+                break
+
+        # Buscar fecha de actualización
+        fechas = re.findall(r'\d{2}/\d{2}/\d{4}', texto)
+        if fechas:
+            resultado["fecha"] = fechas[0]
+            log.info(f"✅ Fecha: {fechas[0]}")
 
     except Exception as e:
-        log.error(f"❌ Error en consulta: {e}")
-        resultado["error"] = str(e)
+        log.warning(f"⚠️ Error en consulta live: {e} — usando último estado conocido")
+        resultado["fuente"] = "último estado conocido (error de conexión)"
 
     return resultado
 
 
-def generar_respuesta(resultado: dict) -> str:
-    ts = datetime.now().strftime("%d/%m/%Y %H:%M")
-    if resultado.get("error"):
-        return (
-            f"⚠️ *Colpensiones Bot* — {ts}\n\n"
-            f"Hubo un error al consultar:\n{resultado['error']}\n\n"
-            f"Intenta más tarde o visita:\n"
-            f"sede.colpensiones.gov.co/tramite/updInfo/39/"
-        )
+# ─── Generación del mensaje ───────────────────────────────────────────────────
+def generar_mensaje(r: dict) -> str:
+    ts = r.get("timestamp", datetime.now().strftime("%d/%m/%Y %H:%M"))
+    fuente = f"\n_Fuente: {r['fuente']}_" if r.get("fuente") else ""
     return (
         f"📋 *Colpensiones — Estado de Trámite*\n"
         f"🗓️ {ts}\n\n"
         f"Tu solicitud de *Reconocimiento* está en:\n\n"
-        f"  • Etapa: *{resultado['etapa']}*\n"
-        f"  • Estado: *{resultado['estado']}*\n"
-        f"  • Radicado: {resultado['numero_radicado']}\n"
-        f"  • Última actualización: {resultado['fecha_actualizacion']}\n\n"
-        f"_Consulta en: sede.colpensiones.gov.co_"
+        f"  • Etapa: *{r['etapa']}*\n"
+        f"  • Estado: *{r['estado']}*\n"
+        f"  • Radicado: {r['radicado']}\n"
+        f"  • Última actualización: {r['fecha']}"
+        f"{fuente}\n\n"
+        f"_Consulta: sede.colpensiones.gov.co_"
     )
 
 
-# ─── Webhook principal ────────────────────────────────────────────────────────
+# ─── Envío asíncrono ──────────────────────────────────────────────────────────
+def consultar_y_enviar(destino: str):
+    """Corre en segundo plano: consulta y envía el resultado por Twilio REST."""
+    try:
+        resultado = consultar_estado()
+        mensaje   = generar_mensaje(resultado)
+        client    = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        msg = client.messages.create(body=mensaje, from_=TWILIO_FROM, to=destino)
+        log.info(f"✅ Resultado enviado a {destino} | SID: {msg.sid}")
+    except Exception as e:
+        log.error(f"❌ Error enviando resultado: {e}")
+
+
+# ─── Webhook WhatsApp ─────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Recibe mensajes de WhatsApp via Twilio y responde con el estado del trámite."""
-    mensaje_entrante = request.form.get("Body", "").strip().lower()
-    remitente = request.form.get("From", "desconocido")
-    log.info(f"📩 Mensaje recibido de {remitente}: '{mensaje_entrante}'")
+    entrante  = request.form.get("Body", "").strip().lower()
+    remitente = request.form.get("From", "?")
+    log.info(f"📩 Mensaje de {remitente}: '{entrante}'")
 
-    # Respuesta inmediata mientras consulta (Twilio espera max 15s)
     resp = MessagingResponse()
 
-    # Comandos de ayuda
-    if mensaje_entrante in ["ayuda", "help", "?"]:
+    if entrante in ["ayuda", "help", "?"]:
         resp.message(
             "🤖 *Colpensiones Bot*\n\n"
-            "Comandos disponibles:\n"
-            "  • *consultar* — Ver estado del trámite\n"
-            "  • *estado* — Ver estado del trámite\n"
-            "  • *ayuda* — Este mensaje\n\n"
-            "Escribe cualquier cosa para consultar."
+            "Escríbeme cualquier cosa y te digo el estado de tu trámite.\n"
+            "Ejemplo: *estado*, *consultar*, *hola*"
         )
         return Response(str(resp), mimetype="application/xml")
 
-    # Cualquier otro mensaje → consultar
-    log.info("🔎 Iniciando consulta en Colpensiones…")
-    resultado = consultar_estado()
-    mensaje_respuesta = generar_respuesta(resultado)
-    resp.message(mensaje_respuesta)
+    # Responder de inmediato a Twilio (evita timeout de 15s)
+    resp.message("🔍 Consultando tu trámite en Colpensiones...\n_Te respondo en unos segundos._")
 
-    log.info(f"✅ Respuesta enviada a {remitente}")
+    # Consulta en segundo plano → envía resultado cuando esté listo
+    Thread(target=consultar_y_enviar, args=(remitente,), daemon=True).start()
+
     return Response(str(resp), mimetype="application/xml")
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return {
-        "status": "ok",
-        "bot": "Colpensiones Bot",
-        "radicado": f"{RADICADO_ANIO}_{RADICADO_COMP}",
-        "timestamp": datetime.now().isoformat(),
-    }
+    return {"status": "ok", "bot": "Colpensiones Bot",
+            "timestamp": datetime.now().isoformat()}
 
 
 @app.route("/consultar", methods=["GET"])
 def consultar_manual():
-    """Endpoint para prueba manual desde el navegador del celular."""
-    resultado = consultar_estado()
-    mensaje = generar_respuesta(resultado)
-    return {"mensaje": mensaje, "resultado": resultado}
+    r = consultar_estado()
+    return {"estado": r, "mensaje": generar_mensaje(r)}
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
